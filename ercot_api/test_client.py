@@ -142,8 +142,7 @@ if __name__ == "__main__":
             try:
                 zip = client.download_bundle(product_id, [report_id])
                 bytes_io = io.BytesIO(zip)
-
-                save_dir = f'/home/dell/code/ercot/ercot/data/{id}_{str(report_id)}'
+                save_dir = f'/home/dell/code/ercot/ercot/data/{product_id}/{product_id}_{str(report_id)}'
                 if not os.path.exists(save_dir):
                     os.mkdir(save_dir)
                     with zipfile.ZipFile(bytes_io, 'r') as zip_ref:
@@ -160,7 +159,6 @@ if __name__ == "__main__":
                 else:
                     print(f'{report_id} already exist')
                 done = True
-
             except:
                 if retry<max_retry:
                     print('retrying')

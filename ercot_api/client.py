@@ -6,10 +6,18 @@ Based on OpenAPI 3.0.1 spec snippet provided by the user.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Deque, Dict, Iterable, Optional
 from urllib.parse import quote_plus, urlencode
-
+from collections import deque
+import zipfile
+import io
+import os
+import glob
+import threading
+import time
 import requests
+from tqdm import tqdm
+
 BASE = "https://api.ercot.com/api/public-data"
 BASE1 = "https://api.ercot.com/api/public-reports"
 
@@ -19,6 +27,8 @@ class ErcotClientConfig:
     timeout: float = 30.0
     api_key: Optional[str] = None
     api_key_in_query: bool = False
+    rate_limit_per_minute: Optional[int] = 30
+    rate_limit_window_seconds: float = 60.0
     token_url: str = (
         "https://ercotb2c.b2clogin.com/"
         "ercotb2c.onmicrosoft.com/"
@@ -43,6 +53,8 @@ class ErcotPublicDataClient:
         base_url: str | None = None,
         timeout: float = 30.0,
         api_key_in_query: bool = False,
+        rate_limit_per_minute: Optional[int] = None,
+        rate_limit_window_seconds: Optional[float] = None,
         token_url: Optional[str] = None,
         client_id: Optional[str] = None,
         scope: Optional[str] = None,
@@ -53,12 +65,24 @@ class ErcotPublicDataClient:
             timeout=timeout,
             api_key=api_key,
             api_key_in_query=api_key_in_query,
+            rate_limit_per_minute=(
+                rate_limit_per_minute
+                if rate_limit_per_minute is not None
+                else ErcotClientConfig.rate_limit_per_minute
+            ),
+            rate_limit_window_seconds=(
+                rate_limit_window_seconds
+                if rate_limit_window_seconds is not None
+                else ErcotClientConfig.rate_limit_window_seconds
+            ),
             token_url=token_url or ErcotClientConfig.token_url,
             client_id=client_id or ErcotClientConfig.client_id,
             scope=scope or ErcotClientConfig.scope,
         )
         self._session = session or requests.Session()
         self._id_token: Optional[str] = None
+        self._rate_limit_lock = threading.Lock()
+        self._rate_limit_timestamps: Deque[float] = deque()
 
     def _headers(self) -> Dict[str, str]:
         headers: Dict[str, str] = {}
@@ -74,8 +98,29 @@ class ErcotPublicDataClient:
             params["subscription-key"] = self.config.api_key
         return params
 
+    def _wait_for_rate_limit(self) -> None:
+        limit = self.config.rate_limit_per_minute
+        if not limit or limit <= 0:
+            return
+        window = self.config.rate_limit_window_seconds
+        while True:
+            with self._rate_limit_lock:
+                now = time.monotonic()
+                cutoff = now - window
+                while self._rate_limit_timestamps and self._rate_limit_timestamps[0] <= cutoff:
+                    self._rate_limit_timestamps.popleft()
+                if len(self._rate_limit_timestamps) < limit:
+                    self._rate_limit_timestamps.append(now)
+                    return
+                sleep_for = (self._rate_limit_timestamps[0] + window) - now
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            else:
+                time.sleep(0)
+
     def _request(self, method: str, path: str, *, params: Optional[Dict[str, Any]] = None,
                  json: Optional[Dict[str, Any]] = None, stream: bool = False) -> requests.Response:
+        self._wait_for_rate_limit()
         url = f"{self.config.base_url.rstrip('/')}/{path.lstrip('/')}"
         response = self._session.request(
             method=method,
@@ -237,3 +282,38 @@ class ErcotPublicDataClient:
             if current_page + 1 >= total_pages:
                 return
             page += 1
+
+    def update_archive(self,product_id = 'np4-33-cd'):
+        report = self.get_product_history_bundles(product_id)
+        ids = [i['docId'] for i in report['bundles']]
+        max_retry = 3
+        for report_id in tqdm(ids):
+            done = False
+            retry = 0
+            while not done:
+                try:
+                    zip = self.download_bundle(product_id, [report_id])
+                    bytes_io = io.BytesIO(zip)
+                    save_dir = f'/home/dell/code/ercot/ercot/data/{product_id}/{product_id}_{str(report_id)}'
+                    if not os.path.exists(save_dir):
+                        os.mkdir(save_dir)
+                        with zipfile.ZipFile(bytes_io, 'r') as zip_ref:
+                            zip_ref.extractall(save_dir)
+                        files = os.listdir(save_dir)
+                        for filei in files:
+                            file_path = os.path.join(save_dir,filei)
+                            with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                                zip_ref.extractall(save_dir)
+                        path_pattern = f"{save_dir}/*.zip"
+                        for file_path in glob.glob(path_pattern):
+                            os.remove(file_path)
+                            print(f"Deleted: {file_path}")
+                    else:
+                        print(f'{report_id} already exist')
+                    done = True
+                except:
+                    if retry<max_retry:
+                        print('retrying')
+                    else:
+                        break
+                    retry+=1
